@@ -1,0 +1,25 @@
+services:
+  telconyx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telconyx:local
+    container_name: telconyx
+    ports:
+      - "9090:9090"
+    environment:
+      TELCONYX_BOT_TOKEN: "${TELCONYX_BOT_TOKEN:?TELCONYX_BOT_TOKEN is required}"
+      TELCONYX_CHAT_ID: "${TELCONYX_CHAT_ID:?TELCONYX_CHAT_ID is required}"
+      TELCONYX_API_KEY: "${TELCONYX_API_KEY:-}"
+      TELCONYX_LISTEN: ":9090"
+      TELCONYX_TIMEOUT: "${TELCONYX_TIMEOUT:-60s}"
+      TELCONYX_MAX_UPLOAD_SIZE: "${TELCONYX_MAX_UPLOAD_SIZE:-2GB}"
+      TELCONYX_MAX_DOWNLOAD_SIZE: "${TELCONYX_MAX_DOWNLOAD_SIZE:-2GB}"
+      TELCONYX_CHUNK_SIZE: "${TELCONYX_CHUNK_SIZE:-49MB}"
+      TELCONYX_CHUNK_CONCURRENCY: "${TELCONYX_CHUNK_CONCURRENCY:-3}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/telconyx", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
