@@ -72,4 +72,3 @@ func (e *FloodWaitError) Duration() time.Duration {
 	}
 	return time.Duration(e.Seconds) * time.Second
 }
-

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -64,5 +65,85 @@ func TestDelete_NonNumericChatID(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "numeric") {
 		t.Errorf("expected numeric-ChatID error, got %s", w.Body.String())
+	}
+}
+
+// TestHealth_SuccessEnvelope verifies the standard success envelope shape.
+func TestHealth_SuccessEnvelope(t *testing.T) {
+	h := newTestHandler(t, "", "-100")
+	w := do(h, "GET", "/health", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if w.Header().Get("X-Request-Id") == "" {
+		t.Error("missing X-Request-Id header")
+	}
+	var resp struct {
+		Data struct {
+			Status string `json:"status"`
+		} `json:"data"`
+		Meta struct {
+			RequestID string `json:"request_id"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, w.Body.String())
+	}
+	if resp.Data.Status != "ok" {
+		t.Errorf("data.status = %q, want ok", resp.Data.Status)
+	}
+	if resp.Meta.RequestID == "" {
+		t.Error("meta.request_id is empty")
+	}
+}
+
+// TestError_Envelope verifies the standard error envelope shape and that the
+// HTTP status is authoritative (no redundant body status, no success:false).
+func TestError_Envelope(t *testing.T) {
+	h := newTestHandler(t, "", "-100")
+	w := do(h, "POST", "/delete", `{bad json`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", w.Code)
+	}
+	var resp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Meta struct {
+			RequestID string `json:"request_id"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, w.Body.String())
+	}
+	if resp.Error.Code != "invalid_json" {
+		t.Errorf("error.code = %q, want invalid_json", resp.Error.Code)
+	}
+	if resp.Error.Message == "" {
+		t.Error("error.message is empty")
+	}
+	if resp.Meta.RequestID == "" {
+		t.Error("meta.request_id is empty")
+	}
+	// X-Request-Id header should match meta.request_id.
+	if got := w.Header().Get("X-Request-Id"); got != resp.Meta.RequestID {
+		t.Errorf("X-Request-Id header %q != meta.request_id %q", got, resp.Meta.RequestID)
+	}
+}
+
+// TestRequestID_PropagatesClientHeader verifies a sanitized incoming
+// X-Request-Id is echoed back for tracing.
+func TestRequestID_PropagatesClientHeader(t *testing.T) {
+	h := newTestHandler(t, "", "-100")
+	req := httptest.NewRequest("GET", "/health", nil)
+	req.Header.Set("X-Request-Id", "trace-abc-123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if got := w.Header().Get("X-Request-Id"); got != "trace-abc-123" {
+		t.Errorf("X-Request-Id = %q, want trace-abc-123 (should propagate)", got)
 	}
 }

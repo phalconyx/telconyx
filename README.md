@@ -111,10 +111,26 @@ Size suffixes are all **binary** (powers of 1024): `B`, `K`/`KB`, `M`/`MB`, `G`/
 
 ## HTTP API (server mode)
 
+All JSON responses share a consistent envelope. **The HTTP status code is authoritative** — the body never contradicts it.
+
+**Success** (`2xx`):
+
+```json
+{ "data": { ... }, "meta": { "request_id": "req_8f2a1c..." } }
+```
+
+**Error** (`4xx`/`5xx`):
+
+```json
+{ "error": { "code": "invalid_link", "message": "human-readable detail" }, "meta": { "request_id": "req_8f2a1c..." } }
+```
+
+`error.code` is a stable, machine-readable identifier (`unauthorized`, `invalid_json`, `missing_url`, `invalid_link`, `missing_file`, `invalid_multipart`, `upload_failed`, `delete_failed`, `internal`); `error.message` is for humans. Every response also carries an `X-Request-Id` header echoing `meta.request_id` — send your own `X-Request-Id` to propagate a trace id. The only non-JSON response is a successful `/download`, which streams raw file bytes.
+
 `GET /health`
 
 ```json
-{"status": "ok", "time": "2025-01-15T10:30:00Z"}
+{ "data": { "status": "ok", "time": "2026-06-17T10:30:00Z" }, "meta": { "request_id": "req_8f2a1c..." } }
 ```
 
 `POST /upload` (multipart/form-data)
@@ -129,29 +145,34 @@ Response `201 Created`:
 
 ```json
 {
-  "url": "telconyx://file/eyJmIjoiQWdBQ0FnSS0tLS0ifQ==",
-  "file_id": "AgACAgIAAxk...",
-  "file_unique_id": "AgAD...",
-  "message_id": 123,
-  "chat_id": -1001234567890,
-  "size": 1048576,
-  "name": "report.pdf",
-  "mime_type": "application/pdf"
+  "data": {
+    "url": "telconyx://file/eyJmIjoiQWdBQ0FnSS0tLS0ifQ==",
+    "file_id": "AgACAgIAAxk...",
+    "file_unique_id": "AgAD...",
+    "message_id": 123,
+    "chat_id": -1001234567890,
+    "size": 1048576,
+    "name": "report.pdf",
+    "mime_type": "application/pdf"
+  },
+  "meta": { "request_id": "req_8f2a1c..." }
 }
 ```
 
-For chunked uploads the response also includes:
+For chunked uploads, `data` also includes `chunk_size`, `chunk_count`, and a `chunks` array:
 
 ```json
 {
-  "...": "...",
-  "chunk_size": 51380224,
-  "chunk_count": 5,
-  "chunks": [
-    {"index": 0, "file_id": "...", "message_id": 100, "size": 51380224},
-    {"index": 1, "file_id": "...", "message_id": 101, "size": 51380224},
-    ...
-  ]
+  "data": {
+    "...": "...",
+    "chunk_size": 51380224,
+    "chunk_count": 5,
+    "chunks": [
+      {"index": 0, "file_id": "...", "message_id": 100, "size": 51380224},
+      {"index": 1, "file_id": "...", "message_id": 101, "size": 51380224}
+    ]
+  },
+  "meta": { "request_id": "req_8f2a1c..." }
 }
 ```
 
@@ -168,7 +189,7 @@ curl -X POST http://localhost:9090/download \
   -OJ
 ```
 
-Response: the file bytes, with `Content-Type`, `Content-Disposition: attachment; filename="..."` and (for chunked files) `X-Telconyx-Chunks: N` headers when known. The real filename and type come from these headers — the output filename you pass to curl (`-o`) is just a local choice and does not have to match.
+Response: on success, the **raw file bytes** (not enveloped), with `Content-Type`, `Content-Disposition: attachment; filename="..."` and (for chunked files) `X-Telconyx-Chunks: N` headers when known. The real filename and type come from these headers — the output filename you pass to curl (`-o`) is just a local choice and does not have to match. Errors that occur *before* streaming begins (bad request, unknown link) use the standard JSON error envelope.
 
 `POST /delete` (application/json)
 
@@ -183,10 +204,8 @@ Response `200 OK`:
 
 ```json
 {
-  "success": true,
-  "deleted_messages": 3,
-  "total_chunks": 3,
-  "skipped": 0
+  "data": { "deleted_messages": 3, "total_chunks": 3, "skipped": 0 },
+  "meta": { "request_id": "req_8f2a1c..." }
 }
 ```
 

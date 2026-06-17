@@ -181,14 +181,14 @@ func TestUploadResult_Link(t *testing.T) {
 
 func TestUploadResult_ChunkedLink(t *testing.T) {
 	r := &UploadResult{
-		FileID:      "fid0",
-		MessageID:   1,
-		ChatID:      -100,
-		Size:        100 * 1024 * 1024,
-		Name:        "big.bin",
-		ChunkSize:   49 * 1024 * 1024,
-		ChunkCount:  3,
-		Chunks:      []ChunkRef{{Index: 0, FileID: "fid0"}, {Index: 1, FileID: "fid1"}, {Index: 2, FileID: "fid2"}},
+		FileID:     "fid0",
+		MessageID:  1,
+		ChatID:     -100,
+		Size:       100 * 1024 * 1024,
+		Name:       "big.bin",
+		ChunkSize:  49 * 1024 * 1024,
+		ChunkCount: 3,
+		Chunks:     []ChunkRef{{Index: 0, FileID: "fid0"}, {Index: 1, FileID: "fid1"}, {Index: 2, FileID: "fid2"}},
 	}
 	parsed, _ := ParseURL(r.Link())
 	if !parsed.IsChunked() {

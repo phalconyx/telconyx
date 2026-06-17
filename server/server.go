@@ -1,16 +1,27 @@
 // Package server exposes Telconyx as an HTTP service.
 //
+// All JSON responses share a consistent envelope:
+//
+//	success: {"data": <payload>, "meta": {"request_id": "..."}}
+//	error:   {"error": {"code": "...", "message": "...", "details": {...}?}, "meta": {"request_id": "..."}}
+//
+// The HTTP status code is authoritative; the body never contradicts it.
+// /download streams raw file bytes on success (no envelope); only its
+// pre-stream errors use the JSON envelope. Every response carries an
+// X-Request-Id header echoing meta.request_id.
+//
 // Endpoints:
 //
 //	GET  /health     - liveness check
-//	POST /upload     - multipart upload, returns FileLink JSON
+//	POST /upload     - multipart upload (field "file"), returns the file's metadata + telconyx:// url
 //	POST /download   - JSON body {"url": "telconyx://..."}, streams file bytes
 //	POST /delete     - JSON body {"url": "telconyx://..."}, deletes the file's Telegram message(s)
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,15 +69,14 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	got := r.Header.Get("X-API-Key")
 	if got == "" || got != h.cfg.APIKey {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid X-API-Key")
 		return false
 	}
 	return true
 }
 
-func (h *handler) health(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+func (h *handler) health(w http.ResponseWriter, r *http.Request) {
+	writeData(w, r, http.StatusOK, map[string]any{
 		"status": "ok",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
@@ -78,12 +88,12 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes)
 	if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid multipart: %v", err))
+		writeError(w, r, http.StatusBadRequest, "invalid_multipart", fmt.Sprintf("invalid multipart form: %v", err))
 		return
 	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("missing 'file' field: %v", err))
+		writeError(w, r, http.StatusBadRequest, "missing_file", fmt.Sprintf("missing 'file' field: %v", err))
 		return
 	}
 	defer file.Close()
@@ -93,7 +103,7 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 	ext := filepath.Ext(header.Filename)
 	tmp, err := os.CreateTemp("", "telconyx-upload-*"+ext)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create temp: %v", err))
+		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("create temp file: %v", err))
 		return
 	}
 	tmpPath := tmp.Name()
@@ -104,14 +114,14 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 		err = cerr
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write temp: %v", err))
+		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("write temp file: %v", err))
 		return
 	}
 
 	// Re-open for the chunked upload path; UploadFileHandle seeks into the file.
 	src, err := os.Open(tmpPath)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("reopen temp: %v", err))
+		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("reopen temp file: %v", err))
 		return
 	}
 	defer src.Close()
@@ -124,17 +134,14 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.client.UploadFileHandle(r.Context(), src, written, opts)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, r, http.StatusBadGateway, "upload_failed", err.Error())
 		return
 	}
 
-	resp := uploadResponse{
+	writeData(w, r, http.StatusCreated, uploadResponse{
 		UploadResult: result,
 		URL:          result.Link(),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(resp)
+	})
 }
 
 type uploadResponse struct {
@@ -150,16 +157,16 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 		URL string `json:"url"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json body: %v", err))
+		writeError(w, r, http.StatusBadRequest, "invalid_json", fmt.Sprintf("invalid json body: %v", err))
 		return
 	}
 	if strings.TrimSpace(req.URL) == "" {
-		writeError(w, http.StatusBadRequest, "missing 'url' field")
+		writeError(w, r, http.StatusBadRequest, "missing_url", "missing 'url' field")
 		return
 	}
 	link, err := telconyx.ParseURL(req.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_link", err.Error())
 		return
 	}
 	if link.MimeType != "" {
@@ -174,9 +181,10 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 	if link.IsChunked() {
 		w.Header().Set("X-Telconyx-Chunks", strconv.Itoa(len(link.AllChunks())))
 	}
+	// On success the body is the raw file stream (not enveloped). If DownloadTo
+	// fails after headers/bytes are already written, we can only abort; the
+	// client sees a truncated response.
 	if _, err := h.client.DownloadTo(r.Context(), link, w); err != nil {
-		// Headers may already be written; just abort.
-		// The client will see a truncated response.
 		return
 	}
 }
@@ -191,16 +199,16 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
 		URL string `json:"url"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json body: %v", err))
+		writeError(w, r, http.StatusBadRequest, "invalid_json", fmt.Sprintf("invalid json body: %v", err))
 		return
 	}
 	if strings.TrimSpace(req.URL) == "" {
-		writeError(w, http.StatusBadRequest, "missing 'url' field")
+		writeError(w, r, http.StatusBadRequest, "missing_url", "missing 'url' field")
 		return
 	}
 	link, err := telconyx.ParseURL(req.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_link", err.Error())
 		return
 	}
 
@@ -215,28 +223,80 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.client.DeleteChunks(r.Context(), link); err != nil {
 		// Some messages may already have been deleted before the failure.
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, r, http.StatusBadGateway, "delete_failed", err.Error())
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success":          true,
+	writeData(w, r, http.StatusOK, map[string]any{
 		"deleted_messages": deletable,
 		"total_chunks":     len(chunks),
 		"skipped":          len(chunks) - deletable,
 	})
 }
 
-func writeError(w http.ResponseWriter, code int, msg string) {
+// writeData writes a success envelope: {"data": <data>, "meta": {"request_id": ...}}.
+func writeData(w http.ResponseWriter, r *http.Request, code int, data any) {
+	rid := requestID(r)
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-Id", rid)
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":   msg,
-		"status":  code,
-		"success": false,
+		"data": data,
+		"meta": map[string]any{"request_id": rid},
 	})
+}
+
+// writeError writes an error envelope with a machine-readable code and a
+// human-readable message. The HTTP status code carries the error category.
+func writeError(w http.ResponseWriter, r *http.Request, code int, errCode, message string) {
+	writeErrorDetails(w, r, code, errCode, message, nil)
+}
+
+// writeErrorDetails is writeError with an optional structured details payload.
+func writeErrorDetails(w http.ResponseWriter, r *http.Request, code int, errCode, message string, details any) {
+	rid := requestID(r)
+	errObj := map[string]any{"code": errCode, "message": message}
+	if details != nil {
+		errObj["details"] = details
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-Id", rid)
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": errObj,
+		"meta":  map[string]any{"request_id": rid},
+	})
+}
+
+// requestID returns a correlation id for the request: the client-supplied
+// X-Request-Id (sanitized) if present, otherwise a freshly generated one.
+func requestID(r *http.Request) string {
+	if id := sanitizeRequestID(r.Header.Get("X-Request-Id")); id != "" {
+		return id
+	}
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "req_unknown"
+	}
+	return "req_" + hex.EncodeToString(b[:])
+}
+
+// sanitizeRequestID keeps only header-safe characters and caps the length, so a
+// client-supplied id can be echoed back without enabling header injection.
+func sanitizeRequestID(s string) string {
+	if len(s) > 128 {
+		s = s[:128]
+	}
+	return strings.Map(func(rn rune) rune {
+		switch {
+		case rn >= 'a' && rn <= 'z', rn >= 'A' && rn <= 'Z', rn >= '0' && rn <= '9':
+			return rn
+		case rn == '-', rn == '_', rn == '.':
+			return rn
+		default:
+			return -1
+		}
+	}, s)
 }
 
 func sanitizeFilename(s string) string {
@@ -248,6 +308,3 @@ func sanitizeFilename(s string) string {
 	}
 	return s
 }
-
-// Ensure the package is referenced even on minor build paths.
-var _ = errors.New
